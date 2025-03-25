@@ -31,7 +31,7 @@ The Druck Model implements a sophisticated multi-factor approach to equity portf
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/yourusername/HolisticEquityModel.git
+git clone https://github.com/rohandaggubati/HolisticEquityModel.git
 cd HolisticEquityModel
 ```
 
