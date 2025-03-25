@@ -169,10 +169,10 @@ class MarketDataCollector:
 
     def get_specified_stocks(self, tickers, lookback_years=5):
         """
-        Collect market data for specific stocks
+        Get data for specified stock tickers
         
         Args:
-            tickers (list): List of stock tickers to collect data for
+            tickers (list): List of stock tickers
             lookback_years (int): Number of years to look back for data
             
         Returns:
@@ -184,96 +184,91 @@ class MarketDataCollector:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=365 * lookback_years)
         
-        # Create a cache key
-        tickers_str = '-'.join(sorted(tickers))
-        cache_key = f"{hash(tickers_str)}_{lookback_years}y"
-        
         # Create a cache directory if it doesn't exist
         os.makedirs('data_cache', exist_ok=True)
-        cache_file = f'data_cache/specified_data_{cache_key}.pkl'
+        cache_file = f'data_cache/market_data_{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}.pkl'
         
-        # Check if data is already cached and less than 7 days old
+        # Check if data is already cached
         if os.path.exists(cache_file):
-            cache_time = os.path.getmtime(cache_file)
-            if (time.time() - cache_time) < 7 * 86400:  # 7 days in seconds
-                print(f"Loading specified stocks data from cache (created {(time.time() - cache_time) / 86400:.1f} days ago)")
-                return pd.read_pickle(cache_file)
+            print(f"Loading market data from cache: {cache_file}")
+            return pd.read_pickle(cache_file)
         
-        # Get stock price data
         all_data = []
+        failed_tickers = []
         
         for i, ticker in enumerate(tickers):
             try:
                 print(f"Getting data for {ticker} ({i+1}/{len(tickers)})...")
                 
-                # Get stock data directly from yfinance
-                ticker_obj = yf.Ticker(ticker)
-                stock_data = ticker_obj.history(period=f"{lookback_years}y")
+                # Add retry logic
+                max_retries = 3
+                retry_delay = 2  # seconds
                 
-                if stock_data.empty:
-                    print(f"No data found for {ticker}, skipping...")
-                    continue
-                
-                # Add a 'Ticker' column before resetting index to preserve it
-                stock_data = stock_data.assign(Ticker=ticker)
-                
-                # Reset index to have Date as a column
-                stock_data = stock_data.reset_index()
-                
-                # Get company info from Yahoo Finance
-                try:
-                    info = ticker_obj.info
-                    
-                    # Add market cap and sector
-                    if 'marketCap' in info:
-                        stock_data['MarketCap'] = info.get('marketCap', np.nan)
-                    else:
-                        stock_data['MarketCap'] = np.nan
-                        
-                    if 'sector' in info:
-                        stock_data['Sector'] = info.get('sector', 'Unknown')
-                    else:
-                        stock_data['Sector'] = 'Unknown'
-                        
-                    # Add fundamental data if available
-                    for key in ['trailingPE', 'forwardPE', 'priceToBook', 'profitMargins', 
-                                'returnOnAssets', 'returnOnEquity', 'debtToEquity',
-                                'trailingEps', 'forwardEps', 'bookValue']:
-                        if key in info:
-                            stock_data[key] = info.get(key, np.nan)
-                    
-                    # Quarterly financial data
+                for attempt in range(max_retries):
                     try:
-                        financials = ticker_obj.quarterly_financials
-                        if not financials.empty:
-                            latest_quarter = financials.columns[0]
-                            stock_data['Revenues'] = financials.loc['Total Revenue', latest_quarter] if 'Total Revenue' in financials.index else np.nan
-                            stock_data['NetIncome'] = financials.loc['Net Income', latest_quarter] if 'Net Income' in financials.index else np.nan
-                            stock_data['OperatingIncome'] = financials.loc['Operating Income', latest_quarter] if 'Operating Income' in financials.index else np.nan
+                        # Get stock data directly from yfinance
+                        ticker_obj = yf.Ticker(ticker)
+                        stock_data = ticker_obj.history(period=f"{lookback_years}y")
+                        
+                        if stock_data.empty:
+                            print(f"No data found for {ticker}, skipping...")
+                            failed_tickers.append(ticker)
+                            break
+                        
+                        # Add a 'Ticker' column before resetting index to preserve it
+                        stock_data = stock_data.assign(Ticker=ticker)
+                        
+                        # Reset index to have Date as a column
+                        stock_data = stock_data.reset_index()
+                        
+                        # Get company info from Yahoo Finance
+                        try:
+                            info = ticker_obj.info
+                            
+                            # Add market cap and sector
+                            if 'marketCap' in info:
+                                stock_data['MarketCap'] = info.get('marketCap', np.nan)
+                            else:
+                                stock_data['MarketCap'] = np.nan
+                                
+                            if 'sector' in info:
+                                stock_data['Sector'] = info.get('sector', 'Unknown')
+                            else:
+                                stock_data['Sector'] = 'Unknown'
+                                
+                            # Add fundamental data if available
+                            if 'forwardPE' in info:
+                                stock_data['ForwardPE'] = info.get('forwardPE', np.nan)
+                            if 'dividendYield' in info:
+                                stock_data['DividendYield'] = info.get('dividendYield', np.nan)
+                            if 'beta' in info:
+                                stock_data['Beta'] = info.get('beta', np.nan)
+                                
+                        except Exception as e:
+                            logger.warning(f"Could not get company info for {ticker}: {str(e)}")
+                            # Add default values for missing info
+                            stock_data['MarketCap'] = np.nan
+                            stock_data['Sector'] = 'Unknown'
+                            stock_data['ForwardPE'] = np.nan
+                            stock_data['DividendYield'] = np.nan
+                            stock_data['Beta'] = np.nan
+                        
+                        all_data.append(stock_data)
+                        break  # Success, exit retry loop
+                        
                     except Exception as e:
-                        logger.warning(f"Error getting financials for {ticker}: {str(e)}")
-                    
-                    # Balance sheet data
-                    try:
-                        balance_sheet = ticker_obj.quarterly_balance_sheet
-                        if not balance_sheet.empty:
-                            latest_quarter = balance_sheet.columns[0]
-                            stock_data['TotalAssets'] = balance_sheet.loc['Total Assets', latest_quarter] if 'Total Assets' in balance_sheet.index else np.nan
-                            stock_data['TotalLiabilities'] = balance_sheet.loc['Total Liabilities Net Minority Interest', latest_quarter] if 'Total Liabilities Net Minority Interest' in balance_sheet.index else np.nan
-                            stock_data['TotalEquity'] = balance_sheet.loc['Total Equity Gross Minority Interest', latest_quarter] if 'Total Equity Gross Minority Interest' in balance_sheet.index else np.nan
-                    except Exception as e:
-                        logger.warning(f"Error getting balance sheet for {ticker}: {str(e)}")
-                    
-                except Exception as e:
-                    logger.warning(f"Error getting additional info for {ticker}: {str(e)}")
-                
-                all_data.append(stock_data)
-                
-                # Don't overload the API
-                time.sleep(0.5)
+                        if attempt < max_retries - 1:
+                            print(f"Attempt {attempt + 1} failed for {ticker}, retrying in {retry_delay} seconds...")
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            print(f"Failed to get data for {ticker} after {max_retries} attempts: {str(e)}")
+                            failed_tickers.append(ticker)
+                            break
                 
             except Exception as e:
-                logger.error(f"Error processing {ticker}: {str(e)}")
+                print(f"Error processing {ticker}: {str(e)}")
+                failed_tickers.append(ticker)
                 continue
         
         if not all_data:
@@ -283,29 +278,15 @@ class MarketDataCollector:
         # Combine all data
         market_data = pd.concat(all_data, ignore_index=True)
         
-        # Debug output
-        print(f"Market data columns: {market_data.columns.tolist()}")
-        print(f"First few rows of market data:\n{market_data.head()}")
+        # Set multi-index
+        market_data = market_data.set_index(['Date', 'Ticker'])
         
-        # Set index to MultiIndex (Date, Ticker) for easier filtering
-        if 'Date' in market_data.columns and 'Ticker' in market_data.columns:
-            market_data = market_data.set_index(['Date', 'Ticker'])
-        else:
-            logger.error("Missing required columns 'Date' or 'Ticker' in market data")
-            if 'Date' not in market_data.columns:
-                logger.error("'Date' column is missing in market_data")
-            if 'Ticker' not in market_data.columns:
-                logger.error("'Ticker' column is missing in market_data")
-            # Print column names for debugging
-            logger.error(f"Available columns: {market_data.columns.tolist()}")
-            return pd.DataFrame()
+        # Save to cache
+        market_data.to_pickle(cache_file)
+        print(f"Saved market data to cache for future use")
         
-        # Cache the data for future use
-        try:
-            market_data.to_pickle(cache_file)
-            print(f"Saved specified stocks data to cache: {cache_file}")
-        except Exception as e:
-            print(f"Warning: Could not save market data to cache: {str(e)}")
+        if failed_tickers:
+            print(f"Failed to get data for {len(failed_tickers)} tickers: {', '.join(failed_tickers)}")
         
         return market_data
     
