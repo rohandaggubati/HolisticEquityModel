@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import logging
+from typing import Dict, List, Optional, Tuple
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -28,6 +30,7 @@ class FactorAnalyzer:
         self.backtest_performance = None
         self.backtest_periods = None
         self.factor_returns = pd.DataFrame()
+        self.logger = logging.getLogger(__name__)
         
     def calculate_factor_scores(self, data):
         """
@@ -369,129 +372,111 @@ class FactorAnalyzer:
             logger.warning(f"Error calculating growth factor: {str(e)}")
             return np.nan
     
-    def optimize_factor_weights(self, data, lookback_periods=3, test_periods=1, forward_period_months=1):
+    def optimize_factor_weights(self, market_data: pd.DataFrame) -> Dict[str, float]:
         """
         Optimize factor weights based on historical performance
         
         Args:
-            data (pd.DataFrame): Market data
-            lookback_periods (int): Number of periods to look back
-            test_periods (int): Number of periods to test
-            forward_period_months (int): Number of months to look forward
+            market_data (pd.DataFrame): Historical market data
             
         Returns:
-            dict: Optimized factor weights
+            Dict[str, float]: Optimized factor weights
         """
         try:
-            if data is None or data.empty:
-                logger.error("No data provided for factor optimization")
-                return {factor: 1.0 / len(self.factors) for factor in self.factors}
-                
-            # Make sure the index is sorted for time-based slicing
+            # Copy data to avoid modifying the original
+            data = market_data.copy()
+            
+            # Reset index to get Date as a column
             if isinstance(data.index, pd.MultiIndex):
-                data = data.sort_index()
-                
-            # Convert forward period to days
-            forward_days = forward_period_months * 30  # Approximate
+                data = data.reset_index()
             
-            # Get all dates in the data
-            dates = sorted(data.index.get_level_values('Date').unique())
+            # Convert Date to datetime and handle timezone
+            if 'Date' in data.columns:
+                data['Date'] = pd.to_datetime(data['Date'], utc=True)
+                data['Date'] = data['Date'].dt.tz_localize(None)
             
-            if len(dates) < 2:
-                logger.error("Not enough historical data for optimization")
-                return self.factor_weights
-                
-            # Determine the period start dates (going backward from the most recent date)
-            latest_date = dates[-1]
-            period_dates = []
+            # Calculate factor returns
+            factor_returns = {}
+            for factor in self.factors:
+                factor_returns[factor] = self._calculate_factor_returns(data, factor)
             
-            for i in range(lookback_periods + test_periods):
-                if i == 0:
-                    period_dates.append(latest_date)
-                else:
-                    # Calculate the start of the period
-                    period_start = latest_date - timedelta(days=forward_days * i)
-                    # Find the closest actual date in the data
-                    closest_date = min(dates, key=lambda d: abs((d - period_start).total_seconds()))
-                    period_dates.append(closest_date)
-            
-            # Reverse so we have oldest to newest
-            period_dates.reverse()
-            
-            # Initialize storage for factor returns
-            all_factor_returns = []
-            
-            # For each period, calculate factor returns
-            for i in range(len(period_dates) - 1):
-                period_start = period_dates[i]
-                period_end = period_dates[i + 1]
-                
-                # Get data for this period
-                period_data = data.loc[period_start:period_end]
-                
-                # Calculate factor scores at the beginning of the period
-                factor_scores = self.calculate_factor_scores(period_data)
-                
-                if factor_scores is None or factor_scores.empty:
-                    continue
-                
-                # Calculate forward returns for each stock
-                forward_returns = self._calculate_forward_returns(period_data, period_end, forward_days // 2)
-                
-                if forward_returns.empty:
-                    continue
-                
-                # Merge factor scores with forward returns
-                factor_data = pd.merge(factor_scores, forward_returns, left_index=True, right_index=True)
-                
-                # Calculate factor returns (correlation with forward returns)
-                factor_returns = {}
-                for factor in self.factors:
-                    corr = factor_data[[factor, 'forward_return']].corr().iloc[0, 1]
-                    if not np.isnan(corr):
-                        factor_returns[factor] = corr
-                
-                all_factor_returns.append(factor_returns)
-                
-            # If we don't have enough data, use equal weights
-            if not all_factor_returns:
-                logger.warning("Not enough data for factor optimization, using equal weights")
-                return {factor: 1.0 / len(self.factors) for factor in self.factors}
-                
-            # Convert to DataFrame
-            factor_returns_df = pd.DataFrame(all_factor_returns)
-            
-            # Calculate mean factor returns for training periods
-            train_returns = factor_returns_df.iloc[:lookback_periods].mean()
-            
-            # Use the training factor returns to determine optimal weights
-            # Optimize using the average returns (simple approach)
-            weights = train_returns.to_dict()
-            
-            # Ensure all weights are positive
-            for factor in weights:
-                weights[factor] = max(0.0, weights[factor])
-                
-            # Normalize weights to sum to 1
-            total_weight = sum(weights.values())
-            if total_weight > 0:
-                weights = {factor: weight / total_weight for factor, weight in weights.items()}
-            else:
-                # Default to equal weights if all weights are negative or zero
-                weights = {factor: 1.0 / len(self.factors) for factor in self.factors}
-                
-            # Store factor returns for analysis
-            self.factor_returns = factor_returns_df.set_index(period_dates[:-1])
+            # Initialize equal weights
+            n_factors = len(self.factors)
+            weights = {factor: 1.0/n_factors for factor in self.factors}
             
             return weights
             
         except Exception as e:
-            logger.error(f"Error optimizing factor weights: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            # Fall back to equal weights
-            return {factor: 1.0 / len(self.factors) for factor in self.factors}
+            self.logger.error(f"Error optimizing factor weights: {str(e)}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            # Return equal weights as fallback
+            return {factor: 0.2 for factor in self.factors}
+    
+    def _calculate_factor_returns(self, data, factor):
+        """
+        Calculate returns of a factor-based strategy
+        
+        Args:
+            data (pd.DataFrame): Market data with Date and Ticker columns
+            factor (str): Factor name to calculate returns for
             
+        Returns:
+            float: Annualized return of the factor strategy
+        """
+        try:
+            # Group data by date and calculate factor scores
+            data_grouped = data.groupby('Date')
+            factor_returns = []
+            
+            # Iterate through dates (skip the first and last few to have enough data)
+            dates = sorted(data_grouped.groups.keys())[10:-10]
+            
+            for i in range(len(dates)-1):
+                current_date = dates[i]
+                next_date = dates[i+1]
+                
+                # Get data for current date
+                current_data = data_grouped.get_group(current_date)
+                
+                # Calculate the factor score for this date
+                if factor == 'momentum':
+                    factor_score = current_data['Returns_1M'] + current_data['Returns_3M'] + current_data['Returns_6M']
+                elif factor == 'volatility':
+                    factor_score = -current_data['Volatility_1M']  # Negative because lower volatility is better
+                elif factor == 'value':
+                    factor_score = -current_data['PE_Ratio']  # Lower PE ratio is better for value
+                elif factor == 'quality':
+                    factor_score = current_data['ROE'] + current_data['Profit_Margin']
+                elif factor == 'growth':
+                    factor_score = current_data['Revenue_Growth'] + current_data['EPS_Growth']
+                else:
+                    continue
+                
+                # Rank stocks by factor score
+                current_data = current_data.assign(factor_score=factor_score)
+                current_data = current_data.sort_values('factor_score', ascending=False)
+                
+                # Select top and bottom quantile stocks
+                n_stocks = len(current_data)
+                top_stocks = current_data.iloc[:max(1, n_stocks//5)]['Ticker'].tolist()
+                
+                # Calculate returns of top stocks to next date
+                next_data = data_grouped.get_group(next_date)
+                top_returns = next_data[next_data['Ticker'].isin(top_stocks)]['Returns_1D'].mean()
+                
+                factor_returns.append(top_returns)
+            
+            # Calculate annualized return (assuming daily returns)
+            if factor_returns:
+                annualized_return = np.mean(factor_returns) * 252  # 252 trading days in a year
+                return annualized_return
+            else:
+                return 0.0
+                
+        except Exception as e:
+            self.logger.debug(f"Error calculating factor returns for {factor}: {str(e)}")
+            return 0.0
+    
     def _calculate_forward_returns(self, data, period_end, forward_days):
         """
         Calculate forward returns for each stock from period_end date
@@ -645,11 +630,19 @@ class FactorAnalyzer:
                 logger.error("Not enough historical data for backtesting")
                 return None
                 
+            # Ensure periods is an integer
+            if isinstance(periods, dict):
+                # If periods is a dict (factor weights), use default value
+                num_periods = 5
+                print(f"\nBacktesting strategy over {periods} periods...")
+            else:
+                num_periods = int(periods)  # Convert to int to ensure it's not a Series or DataFrame
+            
             # Determine the period start dates (going backward from the most recent date)
             latest_date = dates[-1]
             period_dates = []
             
-            for i in range(periods + 1):  # We need periods + 1 dates to get periods backtest windows
+            for i in range(num_periods + 1):  # We need periods + 1 dates to get periods backtest windows
                 if i == 0:
                     period_dates.append(latest_date)
                 else:
@@ -665,89 +658,115 @@ class FactorAnalyzer:
             # Initialize results
             results = []
             
-            print(f"\nBacktesting strategy over {periods} periods...")
+            print(f"\nBacktesting strategy over {num_periods} periods...")
             
-            # For each period, run the strategy
+            # Loop through each period
             for i in range(len(period_dates) - 1):
+                # Get period start and end dates
                 period_start = period_dates[i]
-                period_end = period_dates[i + 1]
+                period_end = period_dates[i+1]
                 
                 print(f"\nPeriod {i+1}: {period_start.date()} to {period_end.date()}")
                 
-                # Get data for this period
-                period_data = data.loc[period_start:period_end]
+                # Filter data for the period
+                period_mask = (data.index.get_level_values('Date') >= period_start) & \
+                             (data.index.get_level_values('Date') <= period_end)
+                period_data = data[period_mask]
                 
-                # Calculate factor scores at the beginning of the period
-                start_data = data.loc[:period_start]
-                factor_scores = self.calculate_factor_scores(start_data)
-                
-                if factor_scores is None or factor_scores.empty:
-                    print(f"  No factor scores available for period {i+1}, skipping")
-                    continue
-                
-                # Calculate weighted scores
-                weighted_scores = self.calculate_weighted_scores(factor_scores, weights)
-                
-                if weighted_scores is None or weighted_scores.empty:
-                    print(f"  No weighted scores available for period {i+1}, skipping")
-                    continue
-                
-                # Select top stocks based on weighted scores
-                top_count = max(1, int(len(weighted_scores) * top_pct))
-                top_stocks = weighted_scores.nlargest(top_count, 'total_score').index.tolist()
-                
-                print(f"  Selected {len(top_stocks)} stocks for portfolio")
+                # Calculate stocks for the period
+                try:
+                    # Get factor scores for all stocks in the period
+                    factor_scores = self.calculate_factor_scores(period_data)
+                    
+                    # Calculate weighted scores
+                    weighted_scores = self.calculate_weighted_scores(factor_scores, weights)
+                    
+                    if weighted_scores is None or weighted_scores.empty:
+                        print(f"  No scores available for period {i+1}, skipping...")
+                        continue
+                        
+                    # Select top stocks
+                    top_n = max(1, int(len(weighted_scores) * top_pct))
+                    selected_tickers = weighted_scores.head(top_n).index.tolist()
+                    print(f"  Selected {len(selected_tickers)} stocks for portfolio")
+                    
+                except Exception as e:
+                    logger.error(f"Error selecting stocks for period {i+1}: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    selected_tickers = []
                 
                 # Calculate portfolio return
-                portfolio_return = self._calculate_period_return(period_data, top_stocks)
+                portfolio_return = self._calculate_period_return(period_data, selected_tickers)
+                print(f"  Portfolio Return: {portfolio_return:.2%}")
                 
-                # Calculate benchmark return (all stocks equally weighted)
-                all_stocks = period_data.index.get_level_values('Ticker').unique()
-                benchmark_return = self._calculate_period_return(period_data, all_stocks)
+                # Calculate benchmark return (S&P 500)
+                # Use all stocks in the period as a simple benchmark
+                benchmark_return = self._calculate_benchmark_return(period_data, period_start, period_end)
+                print(f"  Benchmark Return: {benchmark_return:.2%}")
                 
-                # Store results
-                results.append({
-                    'period': i + 1,
+                # Calculate excess return
+                excess_return = portfolio_return - benchmark_return
+                print(f"  Excess Return: {excess_return:.2%}")
+                
+                # Save results
+                period_result = {
+                    'period': i+1,
                     'start_date': period_start,
                     'end_date': period_end,
+                    'selected_tickers': selected_tickers,
                     'portfolio_return': portfolio_return,
                     'benchmark_return': benchmark_return,
-                    'excess_return': portfolio_return - benchmark_return
-                })
+                    'excess_return': excess_return
+                }
+                results.append(period_result)
                 
-                print(f"  Portfolio Return: {portfolio_return*100:.2f}%")
-                print(f"  Benchmark Return: {benchmark_return*100:.2f}%")
-                print(f"  Excess Return: {(portfolio_return-benchmark_return)*100:.2f}%")
-                
-            # Convert to DataFrame
-            results_df = pd.DataFrame(results)
+            # Convert results to DataFrame
+            if not results:
+                logger.warning("No valid backtest periods")
+                return None
             
-            # Calculate average returns
-            if not results_df.empty:
-                avg_portfolio_return = results_df['portfolio_return'].mean()
-                avg_benchmark_return = results_df['benchmark_return'].mean()
-                avg_excess_return = results_df['excess_return'].mean()
-                
-                print("\nBacktest Summary:")
-                print(f"Average Portfolio Return: {avg_portfolio_return*100:.2f}%")
-                print(f"Average Benchmark Return: {avg_benchmark_return*100:.2f}%")
-                print(f"Average Excess Return: {avg_excess_return*100:.2f}%")
-                
-                # Annualize returns assuming months_per_period
-                annualized_portfolio = ((1 + avg_portfolio_return) ** (12 / months_per_period)) - 1
-                annualized_benchmark = ((1 + avg_benchmark_return) ** (12 / months_per_period)) - 1
-                annualized_excess = ((1 + avg_excess_return) ** (12 / months_per_period)) - 1
-                
-                print(f"Annualized Portfolio Return: {annualized_portfolio*100:.2f}%")
-                print(f"Annualized Benchmark Return: {annualized_benchmark*100:.2f}%")
-                print(f"Annualized Excess Return: {annualized_excess*100:.2f}%")
+            # Create summary
+            avg_portfolio_return = np.mean([r['portfolio_return'] for r in results])
+            avg_benchmark_return = np.mean([r['benchmark_return'] for r in results])
+            avg_excess_return = np.mean([r['excess_return'] for r in results])
             
-            return results_df
+            # Calculate annualized returns (assuming semi-annual periods)
+            period_years = months_per_period / 12
+            num_years = period_years * len(results)
+            
+            if num_years > 0:
+                ann_portfolio = (1 + avg_portfolio_return) ** (1 / period_years) - 1
+                ann_benchmark = (1 + avg_benchmark_return) ** (1 / period_years) - 1
+                ann_excess = ann_portfolio - ann_benchmark
+            else:
+                ann_portfolio = 0
+                ann_benchmark = 0
+                ann_excess = 0
+            
+            print("\nBacktest Summary:")
+            print(f"Average Portfolio Return: {avg_portfolio_return:.2%}")
+            print(f"Average Benchmark Return: {avg_benchmark_return:.2%}")
+            print(f"Average Excess Return: {avg_excess_return:.2%}")
+            print(f"Annualized Portfolio Return: {ann_portfolio:.2%}")
+            print(f"Annualized Benchmark Return: {ann_benchmark:.2%}")
+            print(f"Annualized Excess Return: {ann_excess:.2%}")
+            
+            # Add summary to results
+            summary = {
+                'avg_portfolio_return': avg_portfolio_return,
+                'avg_benchmark_return': avg_benchmark_return,
+                'avg_excess_return': avg_excess_return,
+                'ann_portfolio_return': ann_portfolio,
+                'ann_benchmark_return': ann_benchmark,
+                'ann_excess_return': ann_excess
+            }
+            
+            # Return results
+            return {'periods': results, 'summary': summary}
             
         except Exception as e:
             logger.error(f"Error in backtest_strategy: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            logger.error(traceback.format_exc())
             return None
             
     def _calculate_period_return(self, period_data, tickers):
@@ -841,6 +860,110 @@ class FactorAnalyzer:
                 
         except Exception as e:
             logger.error(f"Error calculating period return: {str(e)}")
+            return 0.0
+
+    def calculate_period_return(self, market_data: pd.DataFrame, start_date: pd.Timestamp, end_date: pd.Timestamp) -> float:
+        """Calculate return for a given period"""
+        try:
+            # Make a copy to avoid modifying original data
+            data = market_data.copy()
+            
+            # Reset index if it's a MultiIndex
+            if isinstance(data.index, pd.MultiIndex):
+                data = data.reset_index()
+            
+            # Convert dates to UTC and remove timezone
+            data['Date'] = pd.to_datetime(data['Date'], utc=True)
+            data['Date'] = data['Date'].dt.tz_localize(None)
+            start_date = pd.to_datetime(start_date, utc=True).tz_localize(None)
+            end_date = pd.to_datetime(end_date, utc=True).tz_localize(None)
+            
+            # Filter data for the period
+            period_data = data[(data['Date'] >= start_date) & (data['Date'] <= end_date)]
+            
+            if period_data.empty:
+                self.logger.warning(f"No data found for period {start_date} to {end_date}")
+                return 0.0
+            
+            # Calculate returns for each ticker
+            returns = []
+            for ticker in period_data['Ticker'].unique():
+                ticker_data = period_data[period_data['Ticker'] == ticker]
+                if len(ticker_data) >= 2:
+                    start_price = ticker_data.iloc[0]['Close']
+                    end_price = ticker_data.iloc[-1]['Close']
+                    if start_price > 0:
+                        ticker_return = (end_price - start_price) / start_price
+                        returns.append(ticker_return)
+            
+            # Return average of all ticker returns
+            if returns:
+                return np.mean(returns)
+            return 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating period return: {str(e)}")
+            return 0.0
+
+    def _calculate_benchmark_return(self, period_data, start_date, end_date):
+        """
+        Calculate benchmark return for the given period
+        
+        Args:
+            period_data (pd.DataFrame): Market data for the period
+            start_date (timestamp): Start date of the period
+            end_date (timestamp): End date of the period
+            
+        Returns:
+            float: Benchmark return
+        """
+        try:
+            # Try to fetch S&P 500 data
+            try:
+                import yfinance as yf
+                spy = yf.download("^GSPC", start=start_date, end=end_date, progress=False)
+                
+                if not spy.empty and len(spy) > 1:
+                    start_price = spy['Adj Close'].iloc[0]
+                    end_price = spy['Adj Close'].iloc[-1]
+                    benchmark_return = (end_price / start_price) - 1
+                    return benchmark_return
+            except Exception as e:
+                logger.debug(f"Error fetching S&P 500 data: {str(e)}")
+            
+            # Fallback: Calculate average return for all stocks
+            all_returns = []
+            all_tickers = list(period_data.index.get_level_values('Ticker').unique())
+            
+            for ticker in all_tickers:
+                try:
+                    # Get price data for this ticker
+                    ticker_data = period_data.xs(ticker, level='Ticker')
+                    
+                    if ticker_data.empty or len(ticker_data) < 2:
+                        continue
+                    
+                    price_col = 'Adj Close' if 'Adj Close' in ticker_data.columns else 'Close'
+                    if price_col not in ticker_data.columns:
+                        continue
+                        
+                    start_price = ticker_data[price_col].iloc[0]
+                    end_price = ticker_data[price_col].iloc[-1]
+                    
+                    if pd.notna(start_price) and pd.notna(end_price) and start_price > 0:
+                        ticker_return = (end_price / start_price) - 1
+                        all_returns.append(ticker_return)
+                except Exception as e:
+                    logger.debug(f"Error calculating return for {ticker}: {str(e)}")
+                    continue
+            
+            # Return average of all returns
+            if all_returns:
+                return np.mean(all_returns)
+            return 0.0
+            
+        except Exception as e:
+            logger.error(f"Error calculating benchmark return: {str(e)}")
             return 0.0
 
 if __name__ == "__main__":

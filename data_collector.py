@@ -9,6 +9,11 @@ from dotenv import load_dotenv
 import time
 import logging
 import pandas_datareader.data as web
+from typing import List
+from constants import (
+    DOW_JONES_TICKERS, SOFTWARE_TICKERS, TMT_TICKERS, AI_TICKERS, 
+    SEMICONDUCTOR_TICKERS, BIOTECH_TICKERS, UNIVERSE_MAPPING
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -22,31 +27,45 @@ class MarketDataCollector:
         self.test_mode = test_mode
         self.sp500_tickers = []
         self.data_cache = {}  # Cache for storing retrieved data
+        self.logger = logging.getLogger(__name__)
+        self.cache_dir = 'data_cache'
+        self.cache_file = os.path.join(self.cache_dir, 'market_data.pkl')
+        self.cache_duration = timedelta(hours=24)
     
-    def get_market_data(self, lookback_years=5, max_stocks=100):
+    def get_market_data(self, lookback_years=5, max_stocks=100, universe='DOW'):
         """
-        Collect market data for stocks in the S&P 500
+        Collect market data for stocks in the specified universe
         
         Args:
             lookback_years (int): Number of years to look back for data
             max_stocks (int): Maximum number of stocks to analyze
+            universe (str): Stock universe to analyze ('DOW', 'SP500', 'AI', etc.)
             
         Returns:
-            pandas.DataFrame: Market data for S&P 500 stocks
+            pandas.DataFrame: Market data with MultiIndex (Date, Ticker)
         """
-        # Get S&P 500 tickers
-        print("Fetching S&P 500 tickers from Wikipedia...")
-        self.sp500_tickers = self._get_sp500_tickers()
+        # Normalize universe to uppercase
+        universe = universe.upper()
+
+        # Get tickers based on universe
+        if universe == 'SP500':
+            print("Using S&P 500 tickers...")
+            self.sp500_tickers = self._get_sp500_tickers()
+        elif universe in UNIVERSE_MAPPING:
+            print(f"Using {UNIVERSE_MAPPING[universe]['name']} tickers...")
+            self.sp500_tickers = UNIVERSE_MAPPING[universe]['tickers']
+        else:
+            print(f"Unknown universe '{universe}', defaulting to DOW...")
+            self.sp500_tickers = DOW_JONES_TICKERS
         
         if self.test_mode:
             # Use a smaller subset in test mode
-            self.sp500_tickers = self.sp500_tickers[:20]
+            self.sp500_tickers = self.sp500_tickers[:10]
             print(f"Test mode: Using {len(self.sp500_tickers)} stocks")
         elif max_stocks and max_stocks < len(self.sp500_tickers):
-            # Limit to top market cap stocks if requested
-            top_tickers = self.get_top_market_cap_stocks(max_stocks)
-            self.sp500_tickers = top_tickers
-            print(f"Using top {len(self.sp500_tickers)} stocks by market cap")
+            # Limit to specified number of stocks
+            self.sp500_tickers = self.sp500_tickers[:max_stocks]
+            print(f"Using top {len(self.sp500_tickers)} stocks from {universe} universe")
         
         # Calculate date range
         end_date = datetime.now()
@@ -54,241 +73,164 @@ class MarketDataCollector:
         
         # Create a cache directory if it doesn't exist
         os.makedirs('data_cache', exist_ok=True)
-        cache_file = f'data_cache/market_data_{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}.pkl'
+        cache_file = f'data_cache/market_data_{universe}_{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}.pkl'
         
         # Check if data is already cached
         if os.path.exists(cache_file):
             print(f"Loading market data from cache: {cache_file}")
-            return pd.read_pickle(cache_file)
+            market_data = pd.read_pickle(cache_file)
+            # Ensure Ticker column exists and MultiIndex structure
+            if 'Ticker' not in market_data.columns and not isinstance(market_data.index, pd.MultiIndex):
+                print("Cache file missing required structure, regenerating data...")
+                os.remove(cache_file)
+                return self.get_market_data(lookback_years, max_stocks, universe)
+            # Set MultiIndex if not already set
+            if not isinstance(market_data.index, pd.MultiIndex):
+                market_data = market_data.set_index(['Date', 'Ticker'])
+            return market_data
         
-        # Get stock price data
+        # Get stock price data in batches
         all_data = []
+        batch_size = 5
         
-        for i, ticker in enumerate(self.sp500_tickers):
-            try:
-                print(f"Getting data for {ticker} ({i+1}/{len(self.sp500_tickers)})...")
-                
-                # Get stock data directly from yfinance
-                ticker_obj = yf.Ticker(ticker)
-                stock_data = ticker_obj.history(period=f"{lookback_years}y")
-                
-                if stock_data.empty:
-                    print(f"No data found for {ticker}, skipping...")
-                    continue
-                
-                # Add a 'Ticker' column before resetting index to preserve it
-                stock_data = stock_data.assign(Ticker=ticker)
-                
-                # Reset index to have Date as a column
-                stock_data = stock_data.reset_index()
-                
-                # Get company info from Yahoo Finance
+        for i in range(0, len(self.sp500_tickers), batch_size):
+            batch = self.sp500_tickers[i:i + batch_size]
+            print(f"Processing batch {i//batch_size + 1}/{(len(self.sp500_tickers) + batch_size - 1)//batch_size}: {i+1}-{min(i+batch_size, len(self.sp500_tickers))} of {len(self.sp500_tickers)}")
+            
+            for ticker in batch:
                 try:
-                    info = ticker_obj.info
+                    # Get stock data directly from yfinance
+                    ticker_obj = yf.Ticker(ticker)
+                    stock_data = ticker_obj.history(period=f"{lookback_years}y")
                     
-                    # Add market cap and sector
-                    if 'marketCap' in info:
+                    if stock_data.empty:
+                        print(f"No data found for {ticker}, skipping...")
+                        continue
+                    
+                    # Add a 'Ticker' column before resetting index to preserve it
+                    stock_data = stock_data.assign(Ticker=ticker)
+                    
+                    # Reset index to have Date as a column
+                    stock_data = stock_data.reset_index()
+                    
+                    # Get company info from Yahoo Finance with timeout
+                    try:
+                        info = ticker_obj.info
+                        
+                        # Add market cap, sector, and industry
                         stock_data['MarketCap'] = info.get('marketCap', np.nan)
-                    else:
-                        stock_data['MarketCap'] = np.nan
-                        
-                    if 'sector' in info:
                         stock_data['Sector'] = info.get('sector', 'Unknown')
-                    else:
-                        stock_data['Sector'] = 'Unknown'
+                        stock_data['Industry'] = info.get('industry', 'Unknown')
                         
-                    # Add fundamental data if available
-                    for key in ['trailingPE', 'forwardPE', 'priceToBook', 'profitMargins', 
-                                'returnOnAssets', 'returnOnEquity', 'debtToEquity',
-                                'trailingEps', 'forwardEps', 'bookValue']:
-                        if key in info:
+                        # Add fundamental data if available
+                        for key in ['trailingPE', 'forwardPE', 'priceToBook', 'profitMargins']:
                             stock_data[key] = info.get(key, np.nan)
-                    
-                    # Quarterly financial data
-                    try:
-                        financials = ticker_obj.quarterly_financials
-                        if not financials.empty:
-                            latest_quarter = financials.columns[0]
-                            stock_data['Revenues'] = financials.loc['Total Revenue', latest_quarter] if 'Total Revenue' in financials.index else np.nan
-                            stock_data['NetIncome'] = financials.loc['Net Income', latest_quarter] if 'Net Income' in financials.index else np.nan
-                            stock_data['OperatingIncome'] = financials.loc['Operating Income', latest_quarter] if 'Operating Income' in financials.index else np.nan
+                        
                     except Exception as e:
-                        logger.warning(f"Error getting financials for {ticker}: {str(e)}")
+                        print(f"Error getting info for {ticker}: {str(e)}")
+                        # Continue with basic data even if info fails
+                        stock_data['MarketCap'] = np.nan
+                        stock_data['Sector'] = 'Unknown'
+                        stock_data['Industry'] = 'Unknown'
                     
-                    # Balance sheet data
-                    try:
-                        balance_sheet = ticker_obj.quarterly_balance_sheet
-                        if not balance_sheet.empty:
-                            latest_quarter = balance_sheet.columns[0]
-                            stock_data['TotalAssets'] = balance_sheet.loc['Total Assets', latest_quarter] if 'Total Assets' in balance_sheet.index else np.nan
-                            stock_data['TotalLiabilities'] = balance_sheet.loc['Total Liabilities Net Minority Interest', latest_quarter] if 'Total Liabilities Net Minority Interest' in balance_sheet.index else np.nan
-                            stock_data['TotalEquity'] = balance_sheet.loc['Total Equity Gross Minority Interest', latest_quarter] if 'Total Equity Gross Minority Interest' in balance_sheet.index else np.nan
-                    except Exception as e:
-                        logger.warning(f"Error getting balance sheet for {ticker}: {str(e)}")
+                    all_data.append(stock_data)
                     
                 except Exception as e:
-                    logger.warning(f"Error getting additional info for {ticker}: {str(e)}")
+                    print(f"Error processing {ticker}: {str(e)}")
+                    continue
                 
-                all_data.append(stock_data)
-                
-                # Don't overload the API
+                # Add a small delay between requests to avoid rate limiting
                 time.sleep(0.5)
-                
-            except Exception as e:
-                logger.error(f"Error processing {ticker}: {str(e)}")
-                continue
         
         if not all_data:
-            logger.error("Failed to retrieve any valid market data.")
-            return pd.DataFrame()
+            raise ValueError("No data was collected for any stocks")
         
         # Combine all data
         market_data = pd.concat(all_data, ignore_index=True)
         
-        # Debug output
-        print(f"Market data columns: {market_data.columns.tolist()}")
-        print(f"First few rows of market data:\n{market_data.head()}")
+        # Ensure required columns exist
+        required_columns = ['Date', 'Ticker', 'Open', 'High', 'Low', 'Close', 'Volume']
+        missing_columns = [col for col in required_columns if col not in market_data.columns]
+        if missing_columns:
+            raise ValueError(f"Missing required columns: {missing_columns}")
         
-        # Set index to MultiIndex (Date, Ticker) for easier filtering
-        if 'Date' in market_data.columns and 'Ticker' in market_data.columns:
-            market_data = market_data.set_index(['Date', 'Ticker'])
-        else:
-            logger.error("Missing required columns 'Date' or 'Ticker' in market data")
-            if 'Date' not in market_data.columns:
-                logger.error("'Date' column is missing in market_data")
-            if 'Ticker' not in market_data.columns:
-                logger.error("'Ticker' column is missing in market_data")
-            # Print column names for debugging
-            logger.error(f"Available columns: {market_data.columns.tolist()}")
-            return pd.DataFrame()
-        
-        # Cache the data for future use
-        market_data.to_pickle(cache_file)
-        
-        return market_data
-
-    def get_specified_stocks(self, tickers, lookback_years=5):
-        """
-        Get data for specified stock tickers
-        
-        Args:
-            tickers (list): List of stock tickers
-            lookback_years (int): Number of years to look back for data
-            
-        Returns:
-            pandas.DataFrame: Market data for specified stocks
-        """
-        print(f"Getting data for {len(tickers)} specified stocks...")
-        
-        # Calculate date range
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=365 * lookback_years)
-        
-        # Create a cache directory if it doesn't exist
-        os.makedirs('data_cache', exist_ok=True)
-        cache_file = f'data_cache/market_data_{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}.pkl'
-        
-        # Check if data is already cached
-        if os.path.exists(cache_file):
-            print(f"Loading market data from cache: {cache_file}")
-            return pd.read_pickle(cache_file)
-        
-        all_data = []
-        failed_tickers = []
-        
-        for i, ticker in enumerate(tickers):
-            try:
-                print(f"Getting data for {ticker} ({i+1}/{len(tickers)})...")
-                
-                # Add retry logic
-                max_retries = 3
-                retry_delay = 2  # seconds
-                
-                for attempt in range(max_retries):
-                    try:
-                        # Get stock data directly from yfinance
-                        ticker_obj = yf.Ticker(ticker)
-                        stock_data = ticker_obj.history(period=f"{lookback_years}y")
-                        
-                        if stock_data.empty:
-                            print(f"No data found for {ticker}, skipping...")
-                            failed_tickers.append(ticker)
-                            break
-                        
-                        # Add a 'Ticker' column before resetting index to preserve it
-                        stock_data = stock_data.assign(Ticker=ticker)
-                        
-                        # Reset index to have Date as a column
-                        stock_data = stock_data.reset_index()
-                        
-                        # Get company info from Yahoo Finance
-                        try:
-                            info = ticker_obj.info
-                            
-                            # Add market cap and sector
-                            if 'marketCap' in info:
-                                stock_data['MarketCap'] = info.get('marketCap', np.nan)
-                            else:
-                                stock_data['MarketCap'] = np.nan
-                                
-                            if 'sector' in info:
-                                stock_data['Sector'] = info.get('sector', 'Unknown')
-                            else:
-                                stock_data['Sector'] = 'Unknown'
-                                
-                            # Add fundamental data if available
-                            if 'forwardPE' in info:
-                                stock_data['ForwardPE'] = info.get('forwardPE', np.nan)
-                            if 'dividendYield' in info:
-                                stock_data['DividendYield'] = info.get('dividendYield', np.nan)
-                            if 'beta' in info:
-                                stock_data['Beta'] = info.get('beta', np.nan)
-                                
-                        except Exception as e:
-                            logger.warning(f"Could not get company info for {ticker}: {str(e)}")
-                            # Add default values for missing info
-                            stock_data['MarketCap'] = np.nan
-                            stock_data['Sector'] = 'Unknown'
-                            stock_data['ForwardPE'] = np.nan
-                            stock_data['DividendYield'] = np.nan
-                            stock_data['Beta'] = np.nan
-                        
-                        all_data.append(stock_data)
-                        break  # Success, exit retry loop
-                        
-                    except Exception as e:
-                        if attempt < max_retries - 1:
-                            print(f"Attempt {attempt + 1} failed for {ticker}, retrying in {retry_delay} seconds...")
-                            time.sleep(retry_delay)
-                            continue
-                        else:
-                            print(f"Failed to get data for {ticker} after {max_retries} attempts: {str(e)}")
-                            failed_tickers.append(ticker)
-                            break
-                
-            except Exception as e:
-                print(f"Error processing {ticker}: {str(e)}")
-                failed_tickers.append(ticker)
-                continue
-        
-        if not all_data:
-            logger.error("Failed to retrieve any valid market data.")
-            return pd.DataFrame()
-        
-        # Combine all data
-        market_data = pd.concat(all_data, ignore_index=True)
-        
-        # Set multi-index
+        # Set MultiIndex (Date, Ticker)
         market_data = market_data.set_index(['Date', 'Ticker'])
         
         # Save to cache
         market_data.to_pickle(cache_file)
-        print(f"Saved market data to cache for future use")
-        
-        if failed_tickers:
-            print(f"Failed to get data for {len(failed_tickers)} tickers: {', '.join(failed_tickers)}")
+        print(f"Saved market data to cache: {cache_file}")
         
         return market_data
+
+    def get_specified_stocks(self, tickers: List[str], lookback_years: int = 5) -> pd.DataFrame:
+        """Get market data for specified stock tickers"""
+        try:
+            # Create cache directory if it doesn't exist
+            os.makedirs('cache', exist_ok=True)
+            
+            # Calculate date range
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=lookback_years*365)
+            
+            # Create cache filename
+            cache_file = f'cache/market_data_{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}.csv'
+            
+            # Try to load from cache first
+            if os.path.exists(cache_file):
+                print("Loading market data from cache...")
+                df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                # Ensure the DataFrame has the correct MultiIndex structure
+                if not isinstance(df.index, pd.MultiIndex):
+                    df = df.reset_index()
+                    df = df.set_index(['Date', 'Ticker'])
+                return df
+            
+            print("Fetching market data from Yahoo Finance...")
+            
+            # Fetch data for each ticker with retries
+            all_data = []
+            failed_tickers = []
+            
+            for ticker in tickers:
+                for attempt in range(3):  # Try up to 3 times
+                    try:
+                        stock = yf.Ticker(ticker)
+                        data = stock.history(start=start_date, end=end_date)
+                        
+                        if data.empty:
+                            print(f"Warning: No data found for {ticker}")
+                            failed_tickers.append(ticker)
+                            break
+                            
+                        # Add Ticker column and reset index to create MultiIndex
+                        data['Ticker'] = ticker
+                        data = data.reset_index()
+                        data = data.set_index(['Date', 'Ticker'])
+                        all_data.append(data)
+                        break
+                        
+                    except Exception as e:
+                        if attempt == 2:  # Last attempt
+                            print(f"Failed to fetch data for {ticker} after 3 attempts: {str(e)}")
+                            failed_tickers.append(ticker)
+                        time.sleep(2)  # Wait 2 seconds between attempts
+            
+            if not all_data:
+                print("Error: No data was successfully retrieved")
+                return None
+                
+            # Combine all data
+            combined_data = pd.concat(all_data)
+            
+            # Save to cache
+            combined_data.to_csv(cache_file)
+            
+            return combined_data
+            
+        except Exception as e:
+            print(f"Error in get_specified_stocks: {str(e)}")
+            return None
     
     def get_top_market_cap_stocks(self, n=100):
         """
@@ -552,7 +494,6 @@ class MarketDataCollector:
             print("Using fallback list of major stocks...")
             
             # Fallback to a subset of large cap stocks if Wikipedia fetch fails
-            from main import DOW_JONES_TICKERS
             sp500_tickers = DOW_JONES_TICKERS + [
                 "AMZN", "GOOGL", "META", "NFLX", "TSLA", "NVDA", "AMD", "PYPL",
                 "ADBE", "COST", "CMCSA", "PEP", "AVGO", "TXN", "QCOM", "GILD",
@@ -738,6 +679,44 @@ class MarketDataCollector:
             print("Continuing without market cap information")
         
         return market_data
+
+    def get_dow_stocks(self) -> List[str]:
+        """Get list of Dow Jones Industrial Average stocks"""
+        return [
+            'AAPL', 'AMGN', 'AXP', 'BA', 'CAT', 'CRM', 'CSCO', 'CVX', 'DIS', 'DOW',
+            'GS', 'HD', 'HON', 'IBM', 'INTC', 'JNJ', 'JPM', 'KO', 'MCD', 'MMM',
+            'MRK', 'MSFT', 'NKE', 'PG', 'TRV', 'UNH', 'V', 'VZ', 'WBA', 'WMT'
+        ]
+
+    def get_ai_stocks(self):
+        """Get a list of AI-focused stocks"""
+        ai_stocks = [
+            # Core AI Companies
+            "NVDA",  # NVIDIA - GPU leader for AI
+            "AMD",   # Advanced Micro Devices - AI chips
+            "INTC",  # Intel - AI processors
+            "GOOGL", # Alphabet - DeepMind and AI research
+            "MSFT",  # Microsoft - Azure AI and OpenAI partnership
+            "META",  # Meta - AI research and applications
+            "AMZN",  # Amazon - AWS AI services
+            "IBM",   # IBM - Watson AI
+            "ORCL",  # Oracle - Cloud AI services
+            
+            # AI Software & Services
+            "CRM",   # Salesforce - AI-powered CRM
+            "PLTR",  # Palantir - AI data analytics
+            "AI",    # C3.ai - Enterprise AI software
+            "U",     # Unity - AI in gaming
+            "SNPS",  # Synopsys - AI in chip design
+            
+            # AI Applications
+            "TSLA",  # Tesla - AI in autonomous vehicles
+            "AAPL",  # Apple - AI in devices
+            "NOW",   # ServiceNow - AI in workflow automation
+            "WDAY",  # Workday - AI in HR
+            "ADBE",  # Adobe - AI in creative tools
+        ]
+        return ai_stocks
 
 if __name__ == "__main__":
     # Test the collector with a small subset of stocks
